@@ -42,8 +42,8 @@ int tracer_init(struct tracer *tracer, struct tracer_callbacks *cbs,
     return 0;
 }
 
-static void handle_stopped(struct tracer *tracer, pid_t pid_curr, int event,
-                           int sig);
+static int handle_stopped(struct tracer *tracer, pid_t pid_curr, int event,
+                          int sig);
 int tracer_loop(struct tracer *tracer) {
     int child_status;
 
@@ -61,28 +61,25 @@ int tracer_loop(struct tracer *tracer) {
     if (WIFSTOPPED(child_status)) {
         int event = child_status >> 8;
         int sig = WSTOPSIG(child_status);
-        handle_stopped(tracer, pid_curr, event, sig);
+        return handle_stopped(tracer, pid_curr, event, sig);
     }
 
     return 0;
 }
 
-static void handle_syscalls(struct tracer *tracer, pid_t pid_curr);
-static void handle_sigtrap(struct tracer *tracer, pid_t pid_curr, int event);
-static void handle_stopped(struct tracer *tracer, pid_t pid_curr, int event,
-                           int sig) {
+static int handle_syscalls(struct tracer *tracer, pid_t pid_curr);
+static int handle_sigtrap(struct tracer *tracer, pid_t pid_curr, int event);
+static int handle_stopped(struct tracer *tracer, pid_t pid_curr, int event,
+                          int sig) {
     switch (sig) {
     case SIGTRAP:
-        handle_sigtrap(tracer, pid_curr, event);
-        break;
+        return handle_sigtrap(tracer, pid_curr, event);
     case SIGTRAP | 0x80:
-        handle_syscalls(tracer, pid_curr);
-        break;
+        return handle_syscalls(tracer, pid_curr);
     case SIGCONT:
-        ptrace(PTRACE_SYSCALL, pid_curr, NULL, NULL);
-        break;
+        return ptrace(PTRACE_SYSCALL, pid_curr, NULL, NULL);
     default:
-        ptrace(PTRACE_SYSCALL, pid_curr, NULL, sig);
+        return ptrace(PTRACE_SYSCALL, pid_curr, NULL, sig);
     }
 }
 
@@ -90,7 +87,7 @@ static void handle_stopped(struct tracer *tracer, pid_t pid_curr, int event,
  * This function is supposed to call the specified callbacks when a case
  * matches, currently all it does it is resume execution.
  */
-static void handle_sigtrap(struct tracer *tracer, pid_t pid_curr, int event) {
+static int handle_sigtrap(struct tracer *tracer, pid_t pid_curr, int event) {
     (void)tracer;
     switch (event) {
     case (SIGTRAP | (PTRACE_EVENT_FORK << 8)):  /* fall-thru */
@@ -98,16 +95,27 @@ static void handle_sigtrap(struct tracer *tracer, pid_t pid_curr, int event) {
     case (SIGTRAP | (PTRACE_EVENT_STOP << 8)):  /* fall-thru */
     case (SIGTRAP | (PTRACE_EVENT_EXIT << 8)):  /* fall-thru */
     default:
-        ptrace(PTRACE_SYSCALL, pid_curr, NULL, NULL);
+        return ptrace(PTRACE_SYSCALL, pid_curr, NULL, NULL);
     }
 }
 
 static int syscall_openat(struct tracer *tracer, pid_t pid_curr,
                           struct user_regs_struct *regs);
-static void handle_syscalls(struct tracer *tracer, pid_t pid_curr) {
+static int handle_syscalls(struct tracer *tracer, pid_t pid_curr) {
     static long last_syscall = -1;
     struct user_regs_struct regs;
-    ptrace(PTRACE_GETREGS, pid_curr, NULL, &regs);
+    if (ptrace(PTRACE_GETREGS, pid_curr, NULL, &regs) == -1) {
+        if (ESRCH == errno) {
+            /* Specified proccess doesn't exist or is not currenlty being
+             * traced. So just return.
+             */
+            return -1;
+        }
+
+        /* If there was another error try to continue the process */
+        goto next;
+    }
+
     long syscall = regs.orig_rax;
 
     /*We get a syscall event once on entry and once on exit.*/
@@ -127,8 +135,15 @@ static void handle_syscalls(struct tracer *tracer, pid_t pid_curr) {
         regs.rax = -EPERM;
     }
 
-    ptrace(PTRACE_SETREGS, pid_curr, NULL, &regs);
-    ptrace(PTRACE_SYSCALL, pid_curr, NULL, NULL);
+    if (ptrace(PTRACE_SETREGS, pid_curr, NULL, &regs) == -1) {
+        /* TODO: Figure out what might cause this. In the mean time abort and
+         * return -1
+         */
+        return -1;
+    }
+
+next:
+    return ptrace(PTRACE_SYSCALL, pid_curr, NULL, NULL);
 }
 
 static char *read_string(pid_t child, unsigned long addr);
@@ -176,11 +191,14 @@ static char *read_string(pid_t child, unsigned long addr) {
     while (1) {
         if (read + sizeof(tmp) > allocated) {
             allocated *= 2;
-            val = realloc(val, allocated);
-            if (val == NULL) {
-                return val;
+            char *temp_ptr = realloc(val, allocated);
+            if (temp_ptr == NULL) {
+                free(val);
+                return NULL;
             }
+            val = temp_ptr;
         }
+        errno = 0;
         tmp = ptrace(PTRACE_PEEKTEXT, child, addr + read, 0);
         if (errno != 0) {
             val[read] = 0;
